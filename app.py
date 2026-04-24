@@ -2,45 +2,65 @@ from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import uuid
+import random
 
 app = Flask(__name__)
 
-# ─── CONFIG ─────────────────────────────
+# ─── CONFIG ─────────────────────────────────────────────
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-key")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///db.sqlite3")
+db_url = os.environ.get("DATABASE_URL", "sqlite:///nexus.db")
+
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# ⚠️ ВАЖНО: threading (СТАБИЛЬНО НА RENDER)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading"
+)
 
-# ─── SIMPLE ONLINE TRACKING ─────────────
+# ─── SIMPLE ONLINE TRACK ───────────────────────────────
 online_users = {}
 
-# ─── MODELS (минимум) ───────────────────
+# ─── MODELS ─────────────────────────────────────────────
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True)
+    display_name = db.Column(db.String(100))
     password = db.Column(db.String(200))
+    online = db.Column(db.Boolean, default=False)
 
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    chat = db.Column(db.String(50))
-    user = db.Column(db.String(50))
-    text = db.Column(db.Text)
-    created = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer)
+    content = db.Column(db.Text)
+    chat_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# ─── HELPERS ────────────────────────────
+# ─── HELPERS ────────────────────────────────────────────
 def current_user():
-    uid = session.get("user")
-    return uid
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    return db.session.get(User, uid)
 
-# ─── AUTH ───────────────────────────────
-@app.route("/api/login", methods=["POST"])
+# ─── ROUTES ─────────────────────────────────────────────
+@app.route("/")
+def index():
+    return "SERVER OK"
+
+@app.route("/api/auth/login", methods=["POST"])
 def login():
     data = request.json
     user = User.query.filter_by(username=data["username"]).first()
@@ -48,68 +68,73 @@ def login():
     if not user:
         return jsonify({"error": "no user"}), 401
 
-    if not bcrypt.check_password_hash(user.password, data["password"]):
-        return jsonify({"error": "wrong pass"}), 401
+    session["user_id"] = user.id
+    user.online = True
+    db.session.commit()
 
-    session["user"] = user.username
-    return jsonify({"ok": True, "user": user.username})
+    return jsonify({"ok": True})
 
-
-@app.route("/api/logout")
+@app.route("/api/auth/logout", methods=["POST"])
 def logout():
+    user = current_user()
+    if user:
+        user.online = False
+        db.session.commit()
+
     session.clear()
     return jsonify({"ok": True})
 
-# ─── SOCKET ─────────────────────────────
+# ─── SOCKETS ───────────────────────────────────────────
 @socketio.on("connect")
 def connect():
     user = current_user()
     if not user:
         return False
 
-    online_users[request.sid] = user
-    print("CONNECTED:", user)
+    online_users[request.sid] = user.id
+    user.online = True
+    db.session.commit()
 
+    emit("online", {"user_id": user.id}, broadcast=True)
 
 @socketio.on("disconnect")
 def disconnect():
-    online_users.pop(request.sid, None)
+    uid = online_users.pop(request.sid, None)
 
+    if uid:
+        user = db.session.get(User, uid)
+        if user:
+            user.online = False
+            db.session.commit()
 
-@socketio.on("join")
-def join(data):
-    join_room(data["chat"])
-
-
-@socketio.on("message")
-def message(data):
-    user = online_users.get(request.sid)
+@socketio.on("send_message")
+def send_message(data):
+    user = current_user()
     if not user:
         return
 
     msg = Message(
-        chat=data["chat"],
-        user=user,
-        text=data["text"]
+        user_id=user.id,
+        chat_id=data.get("chat_id", 1),
+        content=data.get("content", "")
     )
 
     db.session.add(msg)
     db.session.commit()
 
-    emit("message", {
-        "chat": msg.chat,
-        "user": msg.user,
-        "text": msg.text
-    }, room=data["chat"])
+    emit("new_message", {
+        "user_id": user.id,
+        "content": msg.content
+    }, broadcast=True)
 
-# ─── ROUTE ──────────────────────────────
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-# ─── START ──────────────────────────────
+# ─── START ──────────────────────────────────────────────
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
 
-    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        allow_unsafe_werkzeug=True
+    )
