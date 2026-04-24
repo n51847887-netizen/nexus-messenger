@@ -58,7 +58,11 @@ def current_user():
 # ─── ROUTES ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html")
+    try:
+        with open("index.html", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"ERROR LOADING FRONTEND: {str(e)}", 500
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
