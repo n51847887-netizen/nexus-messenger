@@ -58,7 +58,7 @@ def current_user():
 # ─── ROUTES ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return "SERVER OK"
+    return render_template("index.html")
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
