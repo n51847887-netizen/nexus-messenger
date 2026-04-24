@@ -10,13 +10,16 @@ import random
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'nexus-secret-key-change-in-production')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///nexus.db')
+db_url = os.environ.get('DATABASE_URL', 'sqlite:///nexus.db')
+if db_url.startswith('postgres://'):
+    db_url = db_url.replace('postgres://', 'postgresql://', 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # ─── MODELS ───────────────────────────────────────────────────────────────────
 
@@ -80,7 +83,7 @@ def get_current_user():
     user_id = session.get('user_id')
     if not user_id:
         return None
-    return User.query.get(user_id)
+    return db.session.get(User, user_id)
 
 def serialize_user(user, minimal=False):
     if minimal:
@@ -258,7 +261,7 @@ def logout():
     user = get_current_user()
     if user:
         user.online = False
-        user.last_seen = datetime.utcnow()
+        user.last_seen = datetime.now()
         db.session.commit()
     session.clear()
     return jsonify({'ok': True})
@@ -415,10 +418,10 @@ def on_connect():
 def on_disconnect():
     user_id = online_users.pop(request.sid, None)
     if user_id:
-        user = User.query.get(user_id)
+        user = db.session.get(User, user_id)
         if user:
             user.online = False
-            user.last_seen = datetime.utcnow()
+            user.last_seen = datetime.now()
             db.session.commit()
             emit('user_offline', {'user_id': user_id, 'last_seen': user.last_seen.isoformat()}, broadcast=True)
 
@@ -535,4 +538,4 @@ with app.app_context():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
